@@ -1,5 +1,4 @@
-from bitcoin import messages
-from bitcoin.utils import checksum
+from bitcoinnetwork.utils import checksum
 from six import BytesIO
 from gevent import pool
 from gevent import event
@@ -8,9 +7,10 @@ import logging
 import threading
 import struct
 import gevent
+from bitcoin import messages
+from bitcoin import net
 
-__author__ = 'cdecker'
-__version__ = '0.2.1'
+__version__ = '0.3.0'
 
 
 SERVICES = 1
@@ -31,7 +31,7 @@ regtest_params = {
     'port': 18444,
 }
 
-params = mainnet_params
+params = regtest_params
 
 DNS_SEEDS = [
     "seed.bitcoinstats.com",
@@ -41,6 +41,7 @@ DNS_SEEDS = [
     "bitseed.xf2.org"
 ]
 
+parsers = dict((msg.command, msg) for msg in messages.msg_classes)
 
 def configure(new_params):
     global params
@@ -57,20 +58,20 @@ def bootstrap():
     return list(set(peers))
 
 
-class ConnectionEvent(messages.Packet):
+class ConnectionEvent(messages.MsgSerializable):
     """Superclass for a few connection based events."""
 
 
 class ConnectionEstablishedEvent(ConnectionEvent):
-    type = 'ConnectionEstablishedEvent'
+    command = b'ConnectionEstablishedEvent'
 
 
 class ConnectionLostEvent(ConnectionEvent):
-    type = 'ConnectionLostEvent'
+    command = b'ConnectionLostEvent'
 
 
 class ConnectionFailedEvent(ConnectionEvent):
-    type = 'ConnectionFailedEvent'
+    command = b'ConnectionFailedEvent'
 
 
 class Connection:
@@ -100,7 +101,7 @@ class Connection:
         :param payload:
         :return:
         """
-        parser = messages.parsers.get(msg_type)
+        parser = parsers.get(msg_type)
         opts = {'version': self.version, 'segwit': self.is_segwit}
         if not parser:
             logging.debug('No parser found for message of type %s', msg_type)
@@ -109,14 +110,13 @@ class Connection:
             packet.type = msg_type
             return packet
         else:
-            packet = parser()
-            packet.parse(payload, opts)
+            packet = parser.msg_deser(payload)
             return packet
 
     def serialize_message(self, message_type, payload):
         if not isinstance(payload, str):
             buf = BytesIO()
-            payload.toWire(buf, self.version)
+            payload.msg_ser(buf)
             payload = buf.getvalue()
         message = params['magic']
         message += message_type.ljust(12, chr(0))
@@ -136,7 +136,7 @@ class NetworkClient(object):
         self.lock = threading.Lock()
         self.connections = {}
         self.handlers = {}
-        self.register_handler(messages.VersionPacket.type, self.handle_version)
+        self.register_handler(messages.msg_version.command, self.handle_version)
         self.bytes_received = 0
         self.bytes_sent = 0
 
@@ -170,12 +170,12 @@ class NetworkClient(object):
 
     def handle_message(self, connection, message):
         """Dispatch incoming message to handler."""
-        for handler in self.handlers.get(message.type, []):
+        for handler in self.handlers.get(message.command, []):
             try:
                 handler(connection, message)
             except Exception as e:
                 logging.warn('Error while invoking handler %r for message of '
-                             'type %s (%r)', handler, message.type, e,
+                             'type %s (%r)', handler, message.command, e,
                              exc_info=True)
 
     def register_handler(self, msg_type, handler):
@@ -194,9 +194,8 @@ class NetworkClient(object):
         self.handlers[msg_type].append(handler)
 
     def handle_version(self, connection, version):
-        connection.version = version.version
-        connection.services = version.services
-        connection.is_segwit = version.is_segwit()
+        connection.version = version.nVersion
+        connection.services = version.nServices
 
     def run_forever(self):
         """Start the reactor and start processing messages."""
@@ -252,7 +251,7 @@ class GeventConnection(Connection):
                          self.host[0], self.host[1], e)
         except ValueError as e:
             logging.debug("Error while reading from socket %s:%d: %r",
-                         self.host[0], self.host[1], e)
+                          self.host[0], self.host[1], e)
 
         self.connected = False
         del self.network_client.connections[self.host]
@@ -368,10 +367,10 @@ class GeventNetworkClient(NetworkClient):
 class ClientBehavior(object):
     def __init__(self, network_client):
         network_client.register_handler(
-            ConnectionEstablishedEvent.type, self.on_connect
+            ConnectionEstablishedEvent.command, self.on_connect
         )
         network_client.register_handler(
-            messages.VersionPacket.type, self.on_version
+            messages.msg_version.command, self.on_version
         )
 
     def on_connect(self, connection, unused_message):
@@ -386,11 +385,16 @@ class ClientBehavior(object):
             self.send_verack(connection)
 
     def send_version(self, connection):
-        v = messages.VersionPacket()
-        v.addr_from = messages.Address('127.0.0.1', True, 8333, 1)
-        v.addr_recv = messages.Address(connection.host[0], True,
-                                       connection.host[1], 1)
-        v.best_height = 0
+        v = messages.msg_version()
+        v.addr_from = net.CAddress()
+        v.addr_from.ip = '127.0.0.1'
+        v.addr_from.port = 8333
+        v.addr_recv = net.CAddress()
+
+        v.addr_recv.ip = connection.host[0]
+        v.addr_recv.port = connection.host[1]
+
+        v.nStartingHeight = 0
         connection.send('version', v)
 
     def send_verack(self, connection):
