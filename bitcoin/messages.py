@@ -184,7 +184,7 @@ class PingPacket(Packet):
 
     def parse(self, payload, opts):
         if payload:
-            self.nonce = payload
+            self.nonce = payload.getvalue()
 
     def toWire(self, buf, opts):
         if self.nonce:
